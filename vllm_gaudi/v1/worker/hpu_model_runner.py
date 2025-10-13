@@ -2815,11 +2815,9 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
             htorch.core.mark_step()
             selected_req_ids = [batch.req_ids_cpu[idx] for idx in batch.logits_groups_cpu.tolist()]
             htorch.core.mark_step()
-            htorch.hpu.synchronize()
         with self.profiler.record_event('internal', 'unified_sampler'):
             sampling_metadata = self._prepare_sampling(batch_changed, selected_req_ids, pad_to=logits_device.shape[0])
             sampler_output = self.sampler(logits=logits_device, sampling_metadata=sampling_metadata)
-            htorch.hpu.synchronize()
 
         with self.profiler.record_event('internal', 'unified_postprocess'):
             sampled_token_ids_cpu = sampler_output.sampled_token_ids.cpu()
@@ -2856,6 +2854,7 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
                 prompt_logprobs_dict={},
                 pooler_output=[],
             )
+
         return model_runner_output
 
     @torch.inference_mode()
