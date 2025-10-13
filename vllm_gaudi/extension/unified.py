@@ -281,7 +281,7 @@ def to_hpu(data: Optional[Union[torch.tensor, list]], dtype: Optional[torch.dtyp
         return to_hpu(torch.tensor(data, dtype=dtype, device='cpu'))
 
 
-def mask_to_bias(mask: torch.tensor, dtype: torch.dtype) -> torch.tensor:
+def mask_to_bias(mask: torch.tensor, dtype: torch.dtype, bias_placeholder=None) -> torch.tensor:
     """Convert attn mask to attn bias"""
     return torch.zeros_like(mask, dtype=dtype).masked_fill_(mask, -math.inf)
 
@@ -322,10 +322,10 @@ def group_sum(groups: torch.tensor, values: torch.tensor):
     return tmp.index_select(0, groups)
 
 
-def generate_bias(block_usages: torch.tensor, block_size: torch.tensor, dtype: torch.dtype) -> torch.tensor:
+def generate_bias(block_usages: torch.tensor, block_size: torch.tensor, dtype: torch.dtype,
+                  persistent_ctx) -> torch.tensor:
     """ Generate block bias based on block_usage """
-    block_len_range = torch.arange(1, block_size + 1, dtype=block_usages.dtype, device=block_usages.device)
-    block_mask = block_len_range.unsqueeze(0) > block_usages.unsqueeze(-1)
+    block_mask = persistent_ctx.block_len_range.unsqueeze(0) > block_usages.unsqueeze(-1)
     return mask_to_bias(block_mask, dtype=dtype)
 
 
@@ -404,11 +404,22 @@ def hpu_tensor(tensor: torch.tensor, shape: tuple, pad_value: Union[int, float])
     return to_hpu(tensor)
 
 
+class UnifiedBatchPersistentContext:
+
+    def __init__(self, max_num_batched_tokens, max_shared_blocks, max_unique_blocks, block_size, dtype):
+        self.shared_bias = torch.full((max_num_batched_tokens, max_shared_blocks, block_size),
+                                      -math.inf,
+                                      dtype=dtype,
+                                      device='cpu')
+        self.unique_bias = torch.full((max_unique_blocks, block_size), -math.inf, dtype=dtype, device='cpu')
+        self.unique_block_mapping = torch.full((max_unique_blocks, ), -1, dtype=torch.int64, device='cpu')
+        self.block_len_range = torch.arange(1, block_size + 1, dtype=torch.int32, device='cpu')
+
+
 def create_unified_batch(req_ids: list[str], all_token_ids: torch.tensor, num_computed_tokens: torch.tensor,
                          num_scheduled_tokens: torch.tensor, num_prompt_tokens: torch.tensor, block_table: torch.tensor,
-                         block_size: int, dtype: torch.dtype, bucketing_fn: Callable[[bool, int, int, int, int],
-                                                                                     tuple[int, int, int,
-                                                                                           int]]) -> UnifiedBatch:
+                         block_size: int, dtype: torch.dtype, persistent_ctx: UnifiedBatchPersistentContext,
+                         bucketing_fn: Callable[[bool, int, int, int, int], tuple[int, int, int, int]]) -> UnifiedBatch:
     """ Calculate all necessary tensors needed for batch scheduling """
     total_tokens = num_computed_tokens + num_scheduled_tokens
     query_len = num_scheduled_tokens.sum().item()
@@ -460,27 +471,21 @@ def create_unified_batch(req_ids: list[str], all_token_ids: torch.tensor, num_co
             shared_token_idx = shared_group_starts.index_select(0, shared_token_indices) + shared_token_offsets
             shared_block_idx = orig_shared_blocks.index_select(0, shared_token_indices)
             shared_block_usage = shared_ctx.block_usages.index_select(0, shared_token_indices)
-            shared_block_bias = generate_bias(shared_block_usage, block_size, dtype)
+            shared_block_bias = generate_bias(shared_block_usage, block_size, dtype, persistent_ctx)
 
-            shared_bias = torch.full((query_len, shared_blocks.size(0), block_size),
-                                     -math.inf,
-                                     dtype=dtype,
-                                     device=shared_blocks.device)
+            shared_bias = persistent_ctx.shared_bias[:query_len, :shared_blocks.size(0), :block_size]
+            shared_bias.fill_(-math.inf)
             shared_bias.index_put_((shared_token_idx, shared_block_idx), shared_block_bias)
 
         if unique_ctx:
             unique_blocks = torch.amax(unique_ctx.block_ids).item() + 1
-            unique_bias = torch.full((unique_blocks, block_size),
-                                     -math.inf,
-                                     dtype=dtype,
-                                     device=unique_ctx.block_ids.device)
-            unique_block_bias = generate_bias(unique_ctx.block_usages, block_size, dtype)
+            unique_bias = persistent_ctx.unique_bias[:unique_blocks, :block_size]
+            unique_bias.fill_(-math.inf)
+            unique_block_bias = generate_bias(unique_ctx.block_usages, block_size, dtype, persistent_ctx)
             unique_bias.index_copy_(0, unique_ctx.block_ids.to(torch.int64), unique_block_bias)
             unique_group_starts = group_starts.index_select(0, unique_ctx.group_ids)
-            unique_block_mapping = torch.full((unique_blocks, ),
-                                              -1,
-                                              dtype=torch.int64,
-                                              device=unique_ctx.block_ids.device)
+            unique_block_mapping = persistent_ctx.unique_block_mapping[:unique_blocks]
+            unique_block_mapping.fill_(-1)
             unique_block_mapping.index_copy_(0, unique_ctx.block_ids.to(torch.int64), unique_group_starts)
 
     bucket = bucketing_fn(contains_prompts, first_dim(token_ids), first_dim(shared_blocks), unique_blocks,

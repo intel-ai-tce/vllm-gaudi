@@ -336,6 +336,7 @@ class HpuModelAdapter(torch.nn.Module, KVConnectorModelRunnerMixin):
         self._rotary_embed_module = self._get_rotary_embedding_module(self.model)
         self._rotary_prepare_cos_sin = self._get_prepare_cos_sin()
         self.unified_attn = get_config().unified_attn
+        self.unified_attn_persistent_ctx = None
         self.flatten_input = get_config().flatten_input
         self.is_mm_optimized = is_mm_optimized(self.model)
         self.sliding_window = vllm_config.model_config.get_sliding_window()
@@ -2776,7 +2777,7 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
             block_table.apply_(self.defragmenter.resolve)
         return create_unified_batch(self.input_batch.req_ids, all_token_ids, num_computed_tokens, num_scheduled_tokens,
                                     num_prompt_tokens, block_table, self.block_size, self.dtype,
-                                    self.unified_bucketing_fn)
+                                    self.unified_attn_persistent_ctx, self.unified_bucketing_fn)
 
     @torch.inference_mode()
     def unified_execute_model(
@@ -2811,11 +2812,14 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
                     lora_logits_mask=None,
                     lora_mask=None,
                     warmup_mode=warmup_mode)
-        selected_req_ids = [batch.req_ids_cpu[idx] for idx in batch.logits_groups_cpu.tolist()]
-        htorch.core.mark_step()
+            htorch.core.mark_step()
+            selected_req_ids = [batch.req_ids_cpu[idx] for idx in batch.logits_groups_cpu.tolist()]
+            htorch.core.mark_step()
+            htorch.hpu.synchronize()
         with self.profiler.record_event('internal', 'unified_sampler'):
             sampling_metadata = self._prepare_sampling(batch_changed, selected_req_ids, pad_to=logits_device.shape[0])
             sampler_output = self.sampler(logits=logits_device, sampling_metadata=sampling_metadata)
+            htorch.hpu.synchronize()
 
         with self.profiler.record_event('internal', 'unified_postprocess'):
             sampled_token_ids_cpu = sampler_output.sampled_token_ids.cpu()
@@ -4233,6 +4237,11 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
             if self.vllm_config.kv_transfer_config.kv_buffer_device == "cpu":
                 get_kv_transfer_group().set_host_xfer_buffer_ops(copy_kv_blocks)
             global hpu_buffer
+        if self.unified_attn:
+            from vllm_gaudi.extension.unified import UnifiedBatchPersistentContext
+            self.unified_attn_persistent_ctx = UnifiedBatchPersistentContext(self.max_num_batched_tokens, num_blocks,
+                                                                             num_blocks, self.block_size, dtype)
+
         htorch.hpu.synchronize()
 
     def get_supported_generation_tasks(self) -> list[GenerationTask]:
