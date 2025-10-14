@@ -20,9 +20,9 @@ import vllm_gaudi.extension.environment as environment
 from vllm_gaudi.extension.bucketing.common import HPUBucketingManager
 from vllm_gaudi.extension.defragmentation import OnlineDefragmenter
 from vllm_gaudi.extension.profiler import (HabanaHighLevelProfiler, HabanaMemoryProfiler, HabanaProfilerCounterHelper,
-                                           format_bytes, setup_profiler)
+                                           format_bytes, setup_profiler)  #, setup_host_profiler)
 from vllm_gaudi.extension.runtime import finalize_config, get_config
-from vllm_gaudi.extension.unified import (create_unified_batch)
+from vllm_gaudi.extension.unified_batch_np import (create_unified_batch)
 from vllm_gaudi.extension.utils import align_and_pad, pad_list, with_default
 from vllm_gaudi.extension.debug import init_debug_logger
 
@@ -850,7 +850,7 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
         # High-level profiler
         self.profiler = HabanaHighLevelProfiler()
         self.profiler_counter_helper = HabanaProfilerCounterHelper()
-
+        #self.host_profiler = SimpleHostProfiler(logger)
         self.defragmenter = OnlineDefragmenter()
         self.debug_fwd = init_debug_logger('fwd')
 
@@ -2791,17 +2791,35 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
             # Return empty ModelRunnerOuptut if there's no work to do.
             return EMPTY_MODEL_RUNNER_OUTPUT
         htorch.core.mark_step()
-        with self.profiler.record_event('internal', 'prepare_unified_batch'):
-            batch = self.prepare_unified_batch(scheduler_output)
+        batch = self.prepare_unified_batch(scheduler_output)
+
+        #with self.host_profiler.profile('prepare_unified_batch', log_interval=100) as ctx:
+        #    #profiler = setup_host_profiler(warmup=0, active=1)
+        #    #torch.hpu.synchronize()
+        #    #profiler.start()
+        #    batch = self.prepare_unified_batch(scheduler_output)
+        #    torch.hpu.synchronize()
+        #    #profiler.step()
+        #    #profiler.stop()
+        #        #profiler.stop()
+        #    unified_attn_cfg = self._get_unified_config(batch.attn_metadata, batch.logits_indices)
+        #    (phase, qlen, num_shared_blocks, num_unique_blocks, num_logits) = unified_attn_cfg
+        #    suffix = f'{phase}_qlen{qlen}_nsb{num_shared_blocks}_nub{num_unique_blocks}_nlog{num_logits}'
+        #
+        #    #profiler.export_chrome_trace('prepare_unified_batch_' + suffix
+        # + f'.{ math.ceil(profiler.profiler.self_cpu_time_total/1000) }ms' + f'.{time.time_ns()}' + '.gz')
+        #    ctx.append_suffix(suffix)
+
         htorch.core.mark_step()
         if self.is_driver_worker:
             unified_attn_cfg = self._get_unified_config(batch.attn_metadata, batch.logits_indices)
             (phase, qlen, num_shared_blocks, num_unique_blocks, num_logits) = unified_attn_cfg
-            model_event_name = (
-                f"model_forward_{phase}_qlen{qlen}_nsb{num_shared_blocks}_nub{num_unique_blocks}_nlog{num_logits}")
+            suffix = f'{phase}_qlen{qlen}_nsb{num_shared_blocks}_nub{num_unique_blocks}_nlog{num_logits}'
+            model_event_name = (f"model_forward_{suffix}")
         else:
             model_event_name = 'model_executable'
-        with self.profiler.record_event('internal', model_event_name):
+        with self.profiler.record_event(
+                'internal', model_event_name):  #, self.host_profiler.profile(model_event_name, log_interval=100):
             non_flattened_hidden_states, aux_hidden_states, hidden_states, logits_device = \
                 self._execute_model_generic(
                     token_ids=batch.token_ids.unsqueeze(-1),
@@ -4137,6 +4155,7 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
             self._is_inc_finalized = True
 
     def __del__(self):
+        del self.host_profiler
         self.shutdown_inc()
 
     @torch.inference_mode()
@@ -4237,9 +4256,13 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
                 get_kv_transfer_group().set_host_xfer_buffer_ops(copy_kv_blocks)
             global hpu_buffer
         if self.unified_attn:
-            from vllm_gaudi.extension.unified import UnifiedBatchPersistentContext
-            self.unified_attn_persistent_ctx = UnifiedBatchPersistentContext(self.max_num_batched_tokens, num_blocks,
-                                                                             num_blocks, self.block_size, dtype)
+            with HabanaMemoryProfiler() as m:
+                from vllm_gaudi.extension.unified_batch_np import UnifiedBatchPersistentContext
+                self.unified_attn_persistent_ctx = UnifiedBatchPersistentContext(self.max_num_batched_tokens,
+                                                                                 num_blocks, num_blocks,
+                                                                                 self.block_size, dtype)
+            logger.info("Allocating unified persistent batch took %.4f GB of host memory",
+                        m.consumed_host_memory / float(2**30))
 
         htorch.hpu.synchronize()
 
