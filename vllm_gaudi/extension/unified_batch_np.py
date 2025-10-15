@@ -7,12 +7,25 @@ import math
 import functools
 import itertools
 from typing import Optional, Callable, TypeAlias, Union
+from vllm_gaudi.extension.logger import logger as init_logger
+
+logger = init_logger()
 
 
 def mask_to_bias(mask: np.ndarray, dtype: np.dtype, bias_placeholder: np.ndarray = None) -> np.ndarray:
     """Convert attn mask to attn bias"""
-    if bias_placeholder is not None:
-        bias = bias_placeholder[:mask.shape[0], :mask.shape[1]]
+    placeholder_too_small = mask.shape[0] > bias_placeholder.shape[0] or mask.shape[1] > bias_placeholder.shape[1]
+    if placeholder_too_small:
+        msg = (f"Provided bias_placeholder is too small for the required mask shape {mask.shape}. "
+               f"Expected at least {mask.shape[0]}x{mask.shape[1]}, but got "
+               f"{bias_placeholder.shape[0]}x{bias_placeholder.shape[1]}. "
+               f"This usually happens when size of shared context is greater than the entire KV cache. "
+               f"Please consider tuning VLLM_UNIFIED_ATTENTION_SHARED_CACHE_RATIO environment variable. "
+               f"Falling back to dynamic allocation. ")
+        logger.warning(msg)
+    if bias_placeholder is not None and not placeholder_too_small:
+        # IMPORTANT: Make a copy to avoid data leakage between batches
+        bias = bias_placeholder[:mask.shape[0], :mask.shape[1]].copy()
         assert bias.shape == mask.shape
         bias.fill(0)
         bias[mask] = -math.inf
@@ -123,12 +136,10 @@ def hpu_tensor(tensor: np.ndarray, shape: tuple, pad_value: Union[int, float], d
         return None
     assert len(tensor.shape) == len(shape)
     orig_shape = tensor.shape
-    padding = tuple(itertools.chain(*[(0, target - cur) for cur, target in reversed(list(zip(tensor.shape, shape)))]))
-    assert all(p >= 0 for p in padding)
-    if sum(padding) > 0:
-        tensor = np.pad(tensor, [(0, target - cur) for cur, target in zip(tensor.shape, shape)],
-                        mode='constant',
-                        constant_values=pad_value)
+    padding = [(0, target - cur) for cur, target in zip(tensor.shape, shape)]
+    assert all(p[1] >= 0 for p in padding)
+    if sum(p[1] for p in padding) > 0:
+        tensor = np.pad(tensor, padding, mode='constant', constant_values=pad_value)
     # Convert numpy array to torch tensor and move to HPU
     return to_hpu(torch.from_numpy(tensor).to(dtype))
 
@@ -144,18 +155,19 @@ class UnifiedBatchPersistentContext:
         elif dtype == torch.float16:
             np_dtype = np.float16
         elif dtype == torch.bfloat16:
-            np_dtype = np.float16  # numpy doesn't have bfloat16, use float16 as placeholder
+            np_dtype = np.float32  # numpy doesn't have bfloat16, use float32 as placeholder
         else:
             np_dtype = np.float32
 
+        # Intermediate numpy arrays for computation - these ARE reused across batches
         self.shared_bias = np.full((max_num_batched_tokens, max_shared_blocks, block_size), -math.inf, dtype=np_dtype)
 
         # NOTE(kzawora): shared block bias is a weird entity - it maps block usage to each individual token in the context -
         # so the upper bound should be max_shared_blocks*block_size (max_num_shared_tokens) by block_size
-        self.shared_block_bias = np.full((max_shared_blocks * block_size, block_size), -math.inf, dtype=np_dtype)  # ?
+        self.shared_block_bias = np.full((max_shared_blocks * block_size, block_size), -math.inf, dtype=np_dtype)
 
         self.unique_bias = np.full((max_unique_blocks, block_size), -math.inf, dtype=np_dtype)
-        self.unique_block_bias = np.full((max_unique_blocks, block_size), -math.inf, dtype=np_dtype)  # ?
+        self.unique_block_bias = np.full((max_unique_blocks, block_size), -math.inf, dtype=np_dtype)
         self.unique_block_mapping = np.full((max_unique_blocks, ), -1, dtype=np.int64)
         self.block_len_range = np.arange(1, block_size + 1, dtype=np.int32)
         self.causal_bias = np.full((max_num_batched_tokens, max_num_batched_tokens), -math.inf, dtype=np_dtype)
@@ -171,7 +183,6 @@ def create_unified_batch(req_ids: list[str], all_token_ids: torch.Tensor, num_co
     token_positions_dtype = num_computed_tokens.dtype
     logits_indices_dtype = num_scheduled_tokens.dtype
     slot_mapping_dtype = block_table.dtype
-
     # Convert to numpy
     all_token_ids = all_token_ids.numpy()
     num_computed_tokens = num_computed_tokens.numpy()
@@ -266,7 +277,8 @@ def create_unified_batch(req_ids: list[str], all_token_ids: torch.Tensor, num_co
     default_causal_width = 512
     fmin = torch.finfo(dtype).min
     feps = torch.finfo(dtype).tiny
-    #from fpdb import ForkedPdb; ForkedPdb().set_trace()
+
+    # Convert numpy arrays to HPU tensors with proper dtypes
     return UnifiedBatch(req_ids_cpu=req_ids,
                         token_ids=hpu_tensor(token_ids, (target_qlen, ), -1, token_ids_dtype),
                         token_positions=hpu_tensor(token_positions, (target_qlen, ), -1, token_positions_dtype),

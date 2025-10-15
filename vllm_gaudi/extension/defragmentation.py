@@ -82,6 +82,15 @@ class OnlineDefragmenter:
         if self.debug:
             self.debug('initialized')
 
+    def clear_state(self):
+        """ Clear internal state (e.g. after warmup) """
+        self.used_blocks.clear()
+        self.req_blocks.clear()
+        self.fwd_mapping_table.clear()
+        self.bwd_mapping_table.clear()
+        if self.debug:
+            self.debug('state cleared')
+
     def _extend_mapping_table(self, block_id: int):
         """ Make sure mapping_tables are big enough to hold block_id """
         if len(self.fwd_mapping_table) <= block_id:
