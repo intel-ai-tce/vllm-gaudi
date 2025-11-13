@@ -9,7 +9,7 @@ services:
       - /mnt/hf_cache:/mnt/hf_cache
       #- "${VLLM_FOLDER_PATH:-./vllm}/.buildkite:/workspace/.buildkite"
       #- "${VLLM_FOLDER_PATH:-./vllm}/benchmarks:/workspace/benchmarks"
-      #- "./tests/serving-tests-cpu.json:/workspace/.buildkite/nightly-benchmarks/tests/serving-tests-cpu.json:ro"
+      - "./tests/serving-tests-cpu.json:/workspace/.buildkite/nightly-benchmarks/tests/serving-tests-cpu.json:ro"
       - "./results:/workspace/benchmarks/results"
     shm_size: 128g
     environment:
@@ -20,6 +20,6 @@ services:
       VLLM_CPU_KVCACHE_SPACE: 40
       HF_HOME: /mnt/hf_cache
       ON_CPU: 1
-      SERVING_JSON: serving-tests-cpu-snc3.json
+      #SERVING_JSON: serving-tests-cpu-snc3.json
     entrypoint: ["bash", "/workspace/.buildkite/nightly-benchmarks/scripts/run-performance-benchmarks.sh"]
 
